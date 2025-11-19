@@ -170,7 +170,7 @@ class LidarYoloFusionNode(Node):
 
 
     def publish_static_tf(self):
-        """예시로 front 카메라 기준으로 lidar 위치를 TF로 발행."""
+
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = 'rgb_front'
@@ -194,7 +194,7 @@ class LidarYoloFusionNode(Node):
                       left_msg: Image,
                       right_msg: Image,
                       back_msg: Image):
-        """LiDAR + 4 RGB 동기화 처리"""
+
 
         # LiDAR 포인트 한 번만 읽기
         pts_list = []
@@ -439,7 +439,7 @@ class LidarYoloFusionNode(Node):
 
 
     def publish_image(self, img, header, cam_name):
-        """카메라 이름에 따라 다른 overlay 토픽으로 발행."""
+
         msg = self.bridge.cv2_to_imgmsg(img, encoding='bgr8')
         msg.header = header
 
