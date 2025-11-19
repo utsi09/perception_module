@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
+"""
+LiDAR + YOLO Segmentation Fusion Node (+TOPVIEW, 4 Cameras)
 
+- LiDAR 포인트를 4개의 카메라(front/left/right/back)로 각각 투영
+- YOLO 세그멘테이션으로 객체 마스크 얻고,
+  각 객체에 해당하는 LiDAR 포인트들의 거리를 계산해서
+  카메라 이미지 위에 클래스 + 거리 텍스트로 표시
+- 각 카메라마다 오버레이 이미지를 별도 토픽으로 발행
+  /fusion/front/overlay
+  /fusion/left/overlay
+  /fusion/right/overlay
+  /fusion/back/overlay
+- Top-View 이미지는 LiDAR(차량) 좌표계 기준으로 생성하고
+  /fusion/topview 로 발행
+"""
 
 import time
 import numpy as np
@@ -25,82 +39,159 @@ class LidarYoloFusionNode(Node):
 
         self.bridge = CvBridge()
 
-        # 파라미터 선언
         self.declare_parameter('lidar_topic', '/carla/hero/lidar')
-        self.declare_parameter('image_topic', '/carla/hero/rgb_front/image')
-        self.declare_parameter('output_topic', '/fusion/overlay')
+        self.declare_parameter('front_topic', '/carla/hero/rgb_front/image')
+        self.declare_parameter('left_topic',  '/carla/hero/rgb_left/image')
+        self.declare_parameter('right_topic', '/carla/hero/rgb_right/image')
+        self.declare_parameter('back_topic',  '/carla/hero/rgb_back/image')
 
-        # YOLO 설정
+        # 공통 출력 토픽 이름 (지금은 안 씀)
+        self.declare_parameter('output_topic_base', '/fusion')
+
+        # YOLO 관련 파라미터
         self.declare_parameter('model_path', 'yolo11n-seg.pt')
         self.declare_parameter('imgsz', 1280)
-        self.declare_parameter('conf', 0.4)
-        self.declare_parameter('iou', 0.9)
+        self.declare_parameter('conf', 0.6)
+        self.declare_parameter('iou', 0.7)
         self.declare_parameter('device', 'cuda')
 
-        # 최대 거리
+        # depth 표시 범위 (m) - 필요하면 필터에 사용 가능
         self.declare_parameter('max_depth', 60.0)
 
-        # 파라미터 값 읽기
+        # 값 읽기
         self.lidar_topic = self.get_parameter('lidar_topic').value
-        self.image_topic = self.get_parameter('image_topic').value
-        self.output_topic = self.get_parameter('output_topic').value
+        self.front_topic = self.get_parameter('front_topic').value
+        self.left_topic  = self.get_parameter('left_topic').value
+        self.right_topic = self.get_parameter('right_topic').value
+        self.back_topic  = self.get_parameter('back_topic').value
+
+        self.output_topic_base = self.get_parameter('output_topic_base').value
 
         self.model_path = self.get_parameter('model_path').value
         self.imgsz = int(self.get_parameter('imgsz').value)
         self.conf = float(self.get_parameter('conf').value)
         self.iou = float(self.get_parameter('iou').value)
         self.device = self.get_parameter('device').value
-
         self.max_depth = float(self.get_parameter('max_depth').value)
 
-        # LiDAR → Camera 변환행렬
-        self.T_lidar2cam = np.array([
+
+        # LiDAR ↔ Camera Extrinsic / Intrinsic
+
+
+        # LiDAR → Camera 변환 행렬 (CARLA 기준, 이전에 쓰던 값)
+        # LiDAR frame -> 각 카메라 frame
+        self.T_lidar2cam_front = np.array([
             [0, -1,  0,  0.0],
             [0,  0, -1, -0.4],
             [1,  0,  0, -2.0],
             [0,  0,  0,  1.0]
         ], dtype=np.float32)
 
-        # 카메라 내부 파라미터
+        self.T_lidar2cam_left = np.array([
+            [ 1,  0,  0,   1.0],
+            [ 0,  0, -1,  -1.4],
+            [ 0,  1,  0,   0.0],
+            [ 0,  0,  0,   1.0]
+        ], dtype=np.float32)
+
+        self.T_lidar2cam_right = np.array([
+            [ -1,  0,  0,  -1.0],
+            [  0,  0, -1,  -1.4],
+            [  0, -1,  0,   0.0],
+            [  0,  0,  0,   1.0]
+        ], dtype=np.float32)
+
+        self.T_lidar2cam_back = np.array([
+            [ 0,  1,  0,  0.0],
+            [ 0,  0, -1, -0.4],
+            [-1,  0,  0,  2.0],
+            [ 0,  0,  0,  1.0]
+        ], dtype=np.float32)
+
+        # 순서: front, left, right, back
+        self.extrinsic_list = [
+            self.T_lidar2cam_front,
+            self.T_lidar2cam_left,
+            self.T_lidar2cam_right,
+            self.T_lidar2cam_back
+        ]
+
+        # LiDAR -> Camera의 역행렬 (Camera -> LiDAR) 미리 계산 (TopView용)
+        self.cam2lidar_list = [np.linalg.inv(T) for T in self.extrinsic_list]
+
+        # 카메라 intrinsic (CARLA RGB 1024x768, f ~ 512로 가정)
         self.K = np.array([
             [512.0,   0.0, 512.0],
             [  0.0, 512.0, 384.0],
             [  0.0,   0.0,   1.0]
         ], dtype=np.float32)
 
-        # TF broadcaster
+
+        # Static TF (예: front 기준 lidar 위치)
+
         self.tf_broadcaster = tf2_ros.StaticTransformBroadcaster(self)
         self.publish_static_tf()
 
-        # YOLO 로드
+
+        # YOLO 모델 로드
+
         self.get_logger().info(f'Loading YOLO segmentation model: {self.model_path}')
         self.model = YOLO(self.model_path)
         self.class_names = self.model.names
+        self.get_logger().info('YOLO model loaded')
 
-        # 동기화 구독 설정
-        lidar_sub = Subscriber(self, PointCloud2, self.lidar_topic)
-        image_sub = Subscriber(self, Image, self.image_topic)
+
+        # ROS 통신 설정
+
+        lidar_sub  = Subscriber(self, PointCloud2, self.lidar_topic)
+        front_sub  = Subscriber(self, Image, self.front_topic)
+        left_sub   = Subscriber(self, Image, self.left_topic)
+        right_sub  = Subscriber(self, Image, self.right_topic)
+        back_sub   = Subscriber(self, Image, self.back_topic)
 
         self.ts = ApproximateTimeSynchronizer(
-            [lidar_sub, image_sub],
+            [lidar_sub, front_sub, left_sub, right_sub, back_sub],
             queue_size=10,
             slop=0.1
         )
         self.ts.registerCallback(self.sync_callback)
 
-        # 결과 퍼블리셔
-        self.overlay_pub = self.create_publisher(Image, self.output_topic, 10)
-        self.topview_pub = self.create_publisher(Image, "/fusion/topview", 10)
+
+        # 카메라별 overlay 이미지 토픽
+        self.overlay_pub_front = self.create_publisher(
+            Image, f'{self.output_topic_base}/front/overlay', 10)
+        self.overlay_pub_left = self.create_publisher(
+            Image, f'{self.output_topic_base}/left/overlay', 10)
+        self.overlay_pub_right = self.create_publisher(
+            Image, f'{self.output_topic_base}/right/overlay', 10)
+        self.overlay_pub_back = self.create_publisher(
+            Image, f'{self.output_topic_base}/back/overlay', 10)
+
+        # 매핑용 딕셔너리
+        self.overlay_pubs = {
+            'front': self.overlay_pub_front,
+            'left':  self.overlay_pub_left,
+            'right': self.overlay_pub_right,
+            'back':  self.overlay_pub_back,
+        }
+
+        # TopView 토픽
+        self.topview_pub = self.create_publisher(
+            Image, f'{self.output_topic_base}/topview', 10)
+
+        # TopView 스무딩용 center 저장
+        self.prev_centers = {}
 
         self.get_logger().info('LidarYoloFusionNode initialized.')
 
+
     def publish_static_tf(self):
+        """예시로 front 카메라 기준으로 lidar 위치를 TF로 발행."""
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = 'lidar'
-        t.child_frame_id = 'rgb_front'
+        t.header.frame_id = 'rgb_front'
+        t.child_frame_id = 'lidar'
 
-        # 센서 간 위치 관계
         t.transform.translation.x = -2.0
         t.transform.translation.y = 0.0
         t.transform.translation.z = 0.4
@@ -112,192 +203,281 @@ class LidarYoloFusionNode(Node):
 
         self.tf_broadcaster.sendTransform(t)
 
-    def sync_callback(self, lidar_msg: PointCloud2, image_msg: Image):
-        # 이미지 변환
-        try:
-            img = self.bridge.imgmsg_to_cv2(image_msg, desired_encoding='bgr8')
-        except:
-            return
 
-        img_h, img_w = img.shape[:2]
+    def sync_callback(self,
+                      lidar_msg: PointCloud2,
+                      front_msg: Image,
+                      left_msg: Image,
+                      right_msg: Image,
+                      back_msg: Image):
+        """LiDAR + 4 RGB 동기화 처리"""
 
-        # YOLO 실행
-        start_time = time.time()
-        results = self.model(
-            img,
-            device=self.device,
-            imgsz=self.imgsz,
-            conf=self.conf,
-            iou=self.iou,
-            retina_masks=True,
-            verbose=False
-        )
-        infer_ms = (time.time() - start_time) * 1000.0
-        self.get_logger().info(f'YOLO inference time: {infer_ms:.2f} ms')
-
-        r = results[0]
-        result_img = r.plot()
-
-        # 세그멘테이션 없으면 그대로 출력
-        if r.masks is None:
-            self.publish_image(result_img, image_msg.header)
-            return
-
-        masks = r.masks.data.cpu().numpy()
-        classes = r.boxes.cls.cpu().numpy().astype(int)
-        boxes = r.boxes.xyxy.cpu().numpy()
-
-        num_obj = masks.shape[0]
-
-        # LiDAR 포인트 읽기
+        # LiDAR 포인트 한 번만 읽기
         pts_list = []
-        for p in pc2.read_points(lidar_msg, skip_nans=True,
-                                 field_names=("x","y","z","intensity")):
-            pts_list.append([p[0],p[1],p[2],1.0])
+        for p in pc2.read_points(
+            lidar_msg,
+            skip_nans=True,
+            field_names=("x", "y", "z", "intensity")
+        ):
+            # [x, y, z, 1] (homogeneous)
+            pts_list.append([p[0], p[1], p[2], 1.0])
 
         if len(pts_list) == 0:
-            self.publish_image(result_img, image_msg.header)
+            self.get_logger().warn('No LiDAR points.')
             return
 
-        pts_lidar = np.array(pts_list, dtype=np.float32).T
+        pts_lidar = np.array(pts_list, dtype=np.float32).T   # (4, N)
 
-        # 카메라 기준으로 변환
-        pts_cam = self.T_lidar2cam @ pts_lidar
-        z_cam = pts_cam[2,:]
-        front_mask = z_cam > 0
+        # 카메라별 이미지 메시지 / 이름 / 행렬 묶기
+        image_msgs = [front_msg, left_msg, right_msg, back_msg]
+        cam_names  = ['front', 'left', 'right', 'back']
 
-        pts_cam = pts_cam[:, front_mask]
-        z_cam = z_cam[front_mask]
+        # TopView에 쓸 전체 객체 리스트 (LiDAR frame 기준)
+        all_centers_lidar = []
+        all_labels = []
+        all_dists = []
 
-        # 카메라 투영
-        proj = self.K @ pts_cam[:3,:]
-        u = (proj[0,:] / proj[2,:]).astype(np.int32)
-        v = (proj[1,:] / proj[2,:]).astype(np.int32)
-
-        # 이미지 범위 체크
-        in_img = (u>=0)&(u<img_w)&(v>=0)&(v<img_h)
-        pts_cam = pts_cam[:, in_img]
-        u = u[in_img]
-        v = v[in_img]
-
-        obj_centers=[]
-        obj_labels=[]
-        obj_dists=[]
-
-        # 객체별 거리 계산
-        for idx in range(num_obj):
-            cls_id = classes[idx]
-            cls_name = self.class_names.get(cls_id, str(cls_id))
-
-            mask = masks[idx]
-            mask_r = cv2.resize(mask, (img_w, img_h), interpolation=cv2.INTER_NEAREST)
-            mask_bool = mask_r > 0.5
-
-            in_mask = mask_bool[v, u]
-            if not np.any(in_mask):
+        # 카메라마다 별도로 처리
+        for cam_idx, (image_msg, cam_name) in enumerate(zip(image_msgs, cam_names)):
+            try:
+                img = self.bridge.imgmsg_to_cv2(image_msg, desired_encoding='bgr8')
+            except Exception:
                 continue
 
-            pts_obj = pts_cam[:, in_mask]
-            dists = np.linalg.norm(pts_obj[:3,:], axis=0)
-            dist_min = float(np.min(dists))
+            img_h, img_w = img.shape[:2]
 
-            center = np.mean(pts_obj[:3,:], axis=1)
-            obj_centers.append(center)
-            obj_labels.append(cls_name)
-            obj_dists.append(dist_min)
+            #  LiDAR → 현재 카메라 좌표계
+            T_lidar2cam = self.extrinsic_list[cam_idx]
+            pts_cam = T_lidar2cam @ pts_lidar  # (4, N)
 
-            # 바운딩박스 중심
-            x1, y1, x2, y2 = boxes[idx].astype(int)
-            cx = int((x1 + x2) / 2)
-            cy = int((y1 + y2) / 2)
+            # 카메라 앞에 있는 점만 사용 (z > 0)
+            z_cam = pts_cam[2, :]
+            front_mask = z_cam > 0
+            if not np.any(front_mask):
+                # 이 카메라 쪽으로 보이는 LiDAR 점이 없다
+                self.publish_image(img, image_msg.header, cam_name)
+                continue
 
-            # 텍스트 출력
-            text = f"{cls_name} {dist_min:.1f}m"
-            fs = 1.2
-            th = 3
-            (tw, th2), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
-            tx = cx - tw // 2
-            ty = cy + th2 // 2
-            cv2.putText(result_img, text, (tx, ty),
-                        cv2.FONT_HERSHEY_SIMPLEX, fs, (255,255,255), th)
+            pts_cam = pts_cam[:, front_mask]
+            z_cam = z_cam[front_mask]
 
-        # 결과 이미지 퍼블리시
-        self.publish_image(result_img, image_msg.header)
+            #  카메라 intrinsics로 픽셀 좌표로 프로젝션
+            proj = self.K @ pts_cam[:3, :]    # (3, N)
+            u = (proj[0, :] / proj[2, :]).astype(np.int32)
+            v = (proj[1, :] / proj[2, :]).astype(np.int32)
 
-        # Topview 생성
-        topview = self.build_topview(obj_centers, obj_labels, obj_dists)
-        self.publish_topview(topview, image_msg.header)
+            in_img = (u >= 0) & (u < img_w) & (v >= 0) & (v < img_h)
+            if not np.any(in_img):
+                self.publish_image(img, image_msg.header, cam_name)
+                continue
 
-    def build_topview(self, centers, labels, dists):
-        # top-view 크기
-        W, H = 600, 800
+            pts_cam = pts_cam[:, in_img]
+            u = u[in_img]
+            v = v[in_img]
+
+            # YOLO 세그멘테이션 실행
+            start_time = time.time()
+            results = self.model(
+                img,
+                device=self.device,
+                imgsz=self.imgsz,
+                conf=self.conf,
+                iou=self.iou,
+                retina_masks=True,
+                verbose=False
+            )
+            infer_ms = (time.time() - start_time) * 1000.0
+            self.get_logger().info(
+                f'[{cam_name}] YOLO inference time: {infer_ms:.2f} ms')
+
+            r = results[0]
+            result_img = r.plot()
+
+            if r.masks is None:
+                # 객체가 없으면 그냥 YOLO 결과만 출력
+                self.publish_image(result_img, image_msg.header, cam_name)
+                continue
+
+            masks = r.masks.data.cpu().numpy()  # (num_obj, Hm, Wm)
+            classes = r.boxes.cls.cpu().numpy().astype(int)
+            boxes = r.boxes.xyxy.cpu().numpy()
+            num_obj = masks.shape[0]
+
+            cam2lidar = self.cam2lidar_list[cam_idx]
+
+            # 이 카메라에서 검출된 객체들의 center/distance를 TopView용으로 저장
+            for obj_idx in range(num_obj):
+                cls_id = classes[obj_idx]
+                cls_name = self.class_names.get(cls_id, str(cls_id))
+
+                mask = masks[obj_idx]
+                # 마스크 해상도를 현재 이미지 크기로 리사이즈
+                mask_r = cv2.resize(
+                    mask,
+                    (img_w, img_h),
+                    interpolation=cv2.INTER_NEAREST
+                )
+                mask_bool = mask_r > 0.5
+
+                # 프로젝션된 LiDAR 포인트 중, 이 객체 마스크 안에 들어가는 것만 선택
+                in_mask = mask_bool[v, u]
+                if not np.any(in_mask):
+                    continue
+
+                pts_obj_cam = pts_cam[:, in_mask]  # (4, M)
+                dists = np.linalg.norm(pts_obj_cam[:3, :], axis=0)
+                dist_min = float(np.min(dists))
+
+                # 중심점 (카메라 좌표계에서 평균)
+                center_cam = np.mean(pts_obj_cam[:3, :], axis=1)  # (3,)
+
+                # 중심점을 LiDAR(차량) 좌표계로 변환 (TopView용)
+                center_cam_h = np.concatenate([center_cam, [1.0]])  # (4,)
+                center_lidar_h = cam2lidar @ center_cam_h
+                center_lidar = center_lidar_h[:3]
+
+                all_centers_lidar.append(center_lidar)
+                all_labels.append(cls_name)
+                all_dists.append(dist_min)
+
+                # 박스 중앙에 거리 텍스트 표시
+                x1, y1, x2, y2 = boxes[obj_idx].astype(int)
+                cx = int((x1 + x2) / 2)
+                cy = int((y1 + y2) / 2)
+
+                text = f"{cls_name} {dist_min:.1f}m"
+                fs = 0.7
+                th = 2
+                cv2.putText(
+                    result_img, text, (cx - 40, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), th
+                )
+
+            # 이 카메라의 overlay 이미지 퍼블리시
+            self.publish_image(result_img, image_msg.header, cam_name)
+
+        # 3) TopView 이미지 생성
+        if len(all_centers_lidar) > 0:
+            topview = self.build_topview(all_centers_lidar, all_labels, all_dists)
+            # 시간은 일단 front 카메라 헤더 사용
+            self.publish_topview(topview, front_msg.header)
+
+    # -------------------------------------------------------------------------
+    def build_topview(self, centers_lidar, labels, dists):
+        W, H = 800, 800
         img = np.ones((H, W, 3), dtype=np.uint8) * 255
 
-        scale = 20.0
+        # 스케일 (픽셀/미터)
+        scale = 12.0   # 1m -> 5px (필요시 조절)
         origin_x = W // 2
-        origin_y = H - 50
+        origin_y = H//2   # ego 차량을 아래쪽에 두고 위로 갈수록 전방
 
-        # ego 차량 박스
+        # ego 차량 그리기
         car_w, car_h = 40, 70
-        cv2.rectangle(img,
-                      (origin_x - car_w//2, origin_y - car_h),
-                      (origin_x + car_w//2, origin_y),
-                      (180,180,180), -1)
-        cv2.putText(img, "ego", (origin_x - 20, origin_y - car_h - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
+        cv2.rectangle(
+            img,
+            (origin_x - car_w // 2, origin_y - car_h),
+            (origin_x + car_w // 2, origin_y),
+            (180, 180, 180),
+            -1
+        )
+        cv2.putText(
+            img, "ego",
+            (origin_x - 20, origin_y - car_h - 5),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2
+        )
 
-        # 객체 표시
-        for (center, label, dist) in zip(centers, labels, dists):
-            X, Y, Z = center
-            px = int(origin_x + X * scale)
-            py = int(origin_y - Z * scale)
+        # 객체 그리기
+        for center_lidar, label, dist in zip(centers_lidar, labels, dists):
+            l = label.lower()
+            if ("car" not in l and
+                "vehicle" not in l and
+                "truck" not in l and
+                "person" not in l):
+                # 관심 객체만 그림
+                continue
 
-            # 선으로 연결
-            cv2.line(img, (origin_x, origin_y - car_h//2), (px, py), (0,0,0), 2)
+            X, Y, Z = center_lidar  # LiDAR frame (X front, Y right, Z up)
 
-            # 거리 출력
-            mid_x = (origin_x + px) // 2
-            mid_y = (origin_y - car_h//2 + py) // 2
-            cv2.putText(img, f"{dist:.1f}m",
-                        (mid_x - 20, mid_y - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
+            # TopView 좌표로 변환
+            px = int(origin_x - Y * scale)     # 오른쪽이 +Y
+            py = int(origin_y - X * scale)     # 위쪽이 +X
+
+            # 스무딩 키 (라벨 + 위치 대략 이용)
+            key = f"{label}_{int(X)}_{int(Y)}"
+            alpha = 0.7
+
+            if key not in self.prev_centers:
+                self.prev_centers[key] = np.array([px, py], dtype=float)
+            else:
+                self.prev_centers[key] = (
+                    alpha * self.prev_centers[key] +
+                    (1.0 - alpha) * np.array([px, py], dtype=float)
+                )
+
+            px_s, py_s = self.prev_centers[key].astype(int)
+
+            # ego와 연결선
+            cv2.line(
+                img,
+                (origin_x, origin_y - car_h // 2),
+                (px_s, py_s),
+                (0, 0, 0),
+                2
+            )
+
+            # 거리 텍스트
+            mid_x = (origin_x + px_s) // 2
+            mid_y = (origin_y - car_h // 2 + py_s) // 2
+            cv2.putText(
+                img,
+                f"{dist:.1f}m",
+                (mid_x - 20, mid_y - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 0, 0),
+                2
+            )
 
             # 객체 모양
-            l = label.lower()
             if "car" in l or "vehicle" in l or "truck" in l:
-                cv2.rectangle(img, (px - 15, py - 25), (px + 15, py + 25), (255,0,0), -1)
+                cv2.rectangle(
+                    img,
+                    (px_s - 15, py_s - 25),
+                    (px_s + 15, py_s + 25),
+                    (255, 0, 0),
+                    -1
+                )
             elif "person" in l:
-                cv2.circle(img, (px, py), 18, (0,200,0), -1)
-            else:
-                tri = np.array([
-                    [px, py - 25],
-                    [px - 20, py + 20],
-                    [px + 20, py + 20]
-                ], np.int32)
-                cv2.fillPoly(img, [tri], (0,0,255))
+                cv2.circle(img, (px_s, py_s), 18, (0, 200, 0), -1)
 
         return img
 
-    def publish_image(self, img, header):
-        # 이미지 퍼블리시
+
+    def publish_image(self, img, header, cam_name):
+        """카메라 이름에 따라 다른 overlay 토픽으로 발행."""
         msg = self.bridge.cv2_to_imgmsg(img, encoding='bgr8')
         msg.header = header
-        self.overlay_pub.publish(msg)
+
+        pub = self.overlay_pubs.get(cam_name, None)
+        if pub is not None:
+            pub.publish(msg)
+
 
     def publish_topview(self, img, header):
-        # topview 퍼블리시
         msg = self.bridge.cv2_to_imgmsg(img, encoding='bgr8')
         msg.header = header
         self.topview_pub.publish(msg)
 
 
+
 def main(args=None):
-        rclpy.init(args=args)
-        node = LidarYoloFusionNode()
-        rclpy.spin(node)
-        node.destroy_node()
-        rclpy.shutdown()
+    rclpy.init(args=args)
+    node = LidarYoloFusionNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
 
 if __name__ == '__main__':
-        main()
+    main()
