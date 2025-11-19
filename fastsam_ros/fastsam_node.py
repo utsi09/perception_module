@@ -1,20 +1,4 @@
 #!/usr/bin/env python3
-"""
-LiDAR + YOLO Segmentation Fusion Node (+TOPVIEW, 4 Cameras)
-
-- LiDAR 포인트를 4개의 카메라(front/left/right/back)로 각각 투영
-- YOLO 세그멘테이션으로 객체 마스크 얻고,
-  각 객체에 해당하는 LiDAR 포인트들의 거리를 계산해서
-  카메라 이미지 위에 클래스 + 거리 텍스트로 표시
-- 각 카메라마다 오버레이 이미지를 별도 토픽으로 발행
-  /fusion/front/overlay
-  /fusion/left/overlay
-  /fusion/right/overlay
-  /fusion/back/overlay
-- Top-View 이미지는 LiDAR(차량) 좌표계 기준으로 생성하고
-  /fusion/topview 로 발행
-"""
-
 import time
 import numpy as np
 import cv2
