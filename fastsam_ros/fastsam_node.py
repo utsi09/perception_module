@@ -167,7 +167,7 @@ class LidarYoloFusionNode(Node):
 
         # TopView 스무딩용 center 저장
         self.prev_centers = {}
-
+        self.infer_cache = []
         self.get_logger().info('LidarYoloFusionNode initialized.')
 
 
@@ -197,7 +197,7 @@ class LidarYoloFusionNode(Node):
                       right_msg: Image,
                       back_msg: Image):
 
-
+        st_t = time.time()
         # LiDAR 포인트 한 번만 읽기
         pts_list = []
         for p in pc2.read_points(
@@ -273,8 +273,8 @@ class LidarYoloFusionNode(Node):
                 verbose=False
             )
             infer_ms = (time.time() - start_time) * 1000.0
-            self.get_logger().info(
-                f'[{cam_name}] YOLO inference time: {infer_ms:.2f} ms')
+            # self.get_logger().info(
+            #     f'[{cam_name}] YOLO inference time: {infer_ms:.2f} ms')
 
             r = results[0]
             result_img = r.plot()
@@ -347,6 +347,13 @@ class LidarYoloFusionNode(Node):
             topview = self.build_topview(all_centers_lidar, all_labels, all_dists)
             # 시간은 일단 front 카메라 헤더 사용
             self.publish_topview(topview, front_msg.header)
+        infer_time = (time.time() - st_t) * 1000
+        self.infer_cache.append(infer_time)
+        if len(self.infer_cache) > 100:
+            self.get_logger().info(f' 100개 평균 추론 시간은 {np.mean(self.infer_cache)} ms')
+            self.infer_cache.clear()
+
+        self.get_logger().info(f'Infer time is {infer_time} ms')
 
     # -------------------------------------------------------------------------
     def build_topview(self, centers_lidar, labels, dists):
