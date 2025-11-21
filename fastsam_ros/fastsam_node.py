@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+
+
 import time
 import numpy as np
 import cv2
@@ -282,10 +284,10 @@ class LidarYoloFusionNode(Node):
                 self.publish_image(result_img, image_msg.header, cam_name)
                 continue
 
-            masks = r.masks.data.cpu().numpy()  # (num_obj, Hm, Wm)
-            classes = r.boxes.cls.cpu().numpy().astype(int)
-            boxes = r.boxes.xyxy.cpu().numpy()
-            num_obj = masks.shape[0]
+            masks = r.masks.data.cpu().numpy()  # (num_obj, Hm, Wm) 세그멘테이션
+            classes = r.boxes.cls.cpu().numpy().astype(int) # 박스 클래스 명
+            boxes = r.boxes.xyxy.cpu().numpy() # 박스 xyxy
+            num_obj = masks.shape[0] # 객체 개수
 
             cam2lidar = self.cam2lidar_list[cam_idx]
 
@@ -388,31 +390,31 @@ class LidarYoloFusionNode(Node):
             py = int(origin_y - X * scale)     # 위쪽이 +X
 
             # 스무딩 키 (라벨 + 위치 대략 이용)
-            key = f"{label}_{int(X)}_{int(Y)}"
-            alpha = 0.7
+            # key = f"{label}_{int(X)}_{int(Y)}"
+            # alpha = 0.7
 
-            if key not in self.prev_centers:
-                self.prev_centers[key] = np.array([px, py], dtype=float)
-            else:
-                self.prev_centers[key] = (
-                    alpha * self.prev_centers[key] +
-                    (1.0 - alpha) * np.array([px, py], dtype=float)
-                )
+            # if key not in self.prev_centers:
+            #     self.prev_centers[key] = np.array([px, py], dtype=float)
+            # else:
+            #     self.prev_centers[key] = (
+            #         alpha * self.prev_centers[key] +
+            #         (1.0 - alpha) * np.array([px, py], dtype=float)
+            #     )
 
-            px_s, py_s = self.prev_centers[key].astype(int)
+            # px_s, py_s = self.prev_centers[key].astype(int)
 
             # ego와 연결선
             cv2.line(
                 img,
                 (origin_x, origin_y - car_h // 2),
-                (px_s, py_s),
+                (px, py),
                 (0, 0, 0),
                 2
             )
 
             # 거리 텍스트
-            mid_x = (origin_x + px_s) // 2
-            mid_y = (origin_y - car_h // 2 + py_s) // 2
+            mid_x = (origin_x + px) // 2
+            mid_y = (origin_y - car_h // 2 + py) // 2
             cv2.putText(
                 img,
                 f"{dist:.1f}m",
@@ -427,19 +429,18 @@ class LidarYoloFusionNode(Node):
             if "car" in l or "vehicle" in l or "truck" in l:
                 cv2.rectangle(
                     img,
-                    (px_s - 15, py_s - 25),
-                    (px_s + 15, py_s + 25),
+                    (px - 15, py - 25),
+                    (px + 15, py + 25),
                     (255, 0, 0),
                     -1
                 )
             elif "person" in l:
-                cv2.circle(img, (px_s, py_s), 18, (0, 200, 0), -1)
+                cv2.circle(img, (px, py), 18, (0, 200, 0), -1)
 
         return img
 
 
     def publish_image(self, img, header, cam_name):
-
         msg = self.bridge.cv2_to_imgmsg(img, encoding='bgr8')
         msg.header = header
 
