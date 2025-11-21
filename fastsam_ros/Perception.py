@@ -125,6 +125,7 @@ class LidarYoloFusionNode(Node):
         }
 
         self.topview_pub = self.create_publisher(Image, f'{self.output_topic_base}/topview', 10)
+        self.infer_cache = []
         self.prev_centers = {}
 
     def publish_static_tf(self):
@@ -262,6 +263,10 @@ class LidarYoloFusionNode(Node):
             self.publish_topview(top, front_msg.header)
         
         infer_time = (time.time() - st_t) * 1000
+        self.infer_cache.append(infer_time)
+        if len(self.infer_cache) > 100:
+            self.get_logger().info(f' 100개 평균 추론 시간은 {np.mean(self.infer_cache)} ms')
+            self.infer_cache.clear()    
         self.get_logger().info(f'Inference Time : {infer_time} ms')
 
     def build_topview(self, centers_lidar, labels, dists):
